@@ -27,6 +27,9 @@ class OverscrollPop extends StatefulWidget {
   final ScrollToPopOption scrollToPopOption;
   final double friction;
   final BorderRadius? borderRadius;
+  final VoidCallback? onDragStart;
+  final VoidCallback? onDragStop;
+  final VoidCallback? onDismiss;
 
   const OverscrollPop({
     Key? key,
@@ -36,6 +39,9 @@ class OverscrollPop extends StatefulWidget {
     this.enable = true,
     this.friction = 1.0,
     this.borderRadius,
+    this.onDragStart,
+    this.onDragStop,
+    this.onDismiss,
   }) : super(key: key);
 
   @override
@@ -51,13 +57,14 @@ class _OverscrollPopState extends State<OverscrollPop>
   Offset? _previousPosition;
   bool _isDraggingToPopStart = false;
   bool _isDraggingToPop = false;
+  bool _hasTriggeredStart = false;
 
   @override
   void initState() {
     super.initState();
     _animationController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 200),
+      duration: const Duration(milliseconds: 100),
     )..addStatusListener(_onAnimationEnd);
     _animation = Tween<Offset>(
       begin: Offset.zero,
@@ -74,12 +81,16 @@ class _OverscrollPopState extends State<OverscrollPop>
 
   void _onAnimationEnd(AnimationStatus status) {
     if (status == AnimationStatus.completed) {
+      if (_hasTriggeredStart) {
+        widget.onDragStop?.call();
+      }
       _animationController.reset();
       setState(() {
         _dragOffset = null;
         _previousPosition = null;
         _isDraggingToPop = false;
         _isDraggingToPopStart = false;
+        _hasTriggeredStart = false;
       });
     }
   }
@@ -163,8 +174,13 @@ class _OverscrollPopState extends State<OverscrollPop>
       return _onOverScrollDragEnd(scrollNotification.dragDetails);
     }
 
-    if (scrollNotification is ScrollUpdateNotification) {
-      return _onScrollDragUpdate(scrollNotification.dragDetails);
+    // If we have already started the pop gesture (locked), ANY scroll update
+    // should drive the window, not just overscrolls. This ensures we don't
+    // lose control if the framework reports a normal update during the lock.
+    if (_hasTriggeredStart && scrollNotification is ScrollUpdateNotification) {
+      if (scrollNotification.dragDetails != null) {
+        return _setDragOffset(scrollNotification.dragDetails!);
+      }
     }
 
     return false;
@@ -172,25 +188,51 @@ class _OverscrollPopState extends State<OverscrollPop>
 
   bool _onOverScrollDragEnd(DragEndDetails? dragEndDetails) {
     if (_dragOffset == null) return false;
+
+    // Ignore phantom end notifications (null details) to prevent premature unlocking
+    // while the user might still be interacting or switching directions.
+    if (dragEndDetails == null) return false;
+
     final dragOffset = _dragOffset!;
 
     final screenSize = MediaQuery.of(context).size;
 
-    if (dragEndDetails != null) {
-      if (dragOffset.dy.abs() >= screenSize.height / 3 ||
-          dragOffset.dx.abs() >= screenSize.width / 1.8) {
-        Navigator.of(context).pop();
-        return false;
-      }
+    // Check direction consistency
+    bool isValidDirection = true;
+    if (widget.scrollToPopOption == ScrollToPopOption.start &&
+        dragOffset.dy < 0) {
+      isValidDirection = false;
+    } else if (widget.scrollToPopOption == ScrollToPopOption.end &&
+        dragOffset.dy > 0) {
+      isValidDirection = false;
+    }
 
-      final velocity = dragEndDetails.velocity.pixelsPerSecond;
-      final velocityY = velocity.dy / widget.friction / widget.friction;
-      final velocityX = velocity.dx / widget.friction / widget.friction;
+    if (isValidDirection &&
+        (dragOffset.dy.abs() >= screenSize.height / 3 ||
+            dragOffset.dx.abs() >= screenSize.width / 1.8)) {
+      widget.onDismiss?.call();
+      Navigator.of(context).pop();
+      return false;
+    }
 
-      if (velocityY.abs() > 150.0 || velocityX.abs() > 200.0) {
-        Navigator.of(context).pop();
-        return false;
-      }
+    final velocity = dragEndDetails.velocity.pixelsPerSecond;
+    final velocityY = velocity.dy / widget.friction / widget.friction;
+    final velocityX = velocity.dx / widget.friction / widget.friction;
+
+    // Also check direction for velocity dismiss
+    bool isValidVelocityDirection = true;
+    if (widget.scrollToPopOption == ScrollToPopOption.start && velocityY < 0) {
+      isValidVelocityDirection = false;
+    } else if (widget.scrollToPopOption == ScrollToPopOption.end &&
+        velocityY > 0) {
+      isValidVelocityDirection = false;
+    }
+
+    if (isValidVelocityDirection &&
+        (velocityY.abs() > 150.0 || velocityX.abs() > 200.0)) {
+      widget.onDismiss?.call();
+      Navigator.of(context).pop();
+      return false;
     }
 
     setState(() {
@@ -200,7 +242,7 @@ class _OverscrollPopState extends State<OverscrollPop>
       ).animate(_animationController);
     });
 
-    _animationController.forward();
+    _animationController.forward(from: 0.0);
     return false;
   }
 
@@ -219,11 +261,14 @@ class _OverscrollPopState extends State<OverscrollPop>
   bool _onOverScrollDragUpdate(OverscrollNotification overscrollNotification) {
     final scrollToPopOption = widget.scrollToPopOption;
 
-    if (scrollToPopOption == ScrollToPopOption.start &&
-        overscrollNotification.overscroll > 0) return false;
+    // Allow updates IF we have already triggered start, enabling reverse drag (back to origin).
+    if (!_hasTriggeredStart) {
+      if (scrollToPopOption == ScrollToPopOption.start &&
+          overscrollNotification.overscroll > 0) return false;
 
-    if (scrollToPopOption == ScrollToPopOption.end &&
-        overscrollNotification.overscroll < 0) return false;
+      if (scrollToPopOption == ScrollToPopOption.end &&
+          overscrollNotification.overscroll < 0) return false;
+    }
 
     final dragUpdateDetails = overscrollNotification.dragDetails;
     if (dragUpdateDetails == null) return false;
@@ -236,6 +281,17 @@ class _OverscrollPopState extends State<OverscrollPop>
       return false;
     }
 
+    if (_dragOffset == null && !_hasTriggeredStart) {
+      widget.onDragStart?.call();
+      _hasTriggeredStart = true;
+    }
+
+    // Safety check
+    if (!_hasTriggeredStart && _dragOffset == null) {
+      _previousPosition = dragUpdateDetails.globalPosition;
+      return false;
+    }
+
     final currentPosition = dragUpdateDetails.globalPosition;
     final previousPosition = _previousPosition!;
 
@@ -244,6 +300,10 @@ class _OverscrollPopState extends State<OverscrollPop>
     final newY = (_dragOffset?.dy ?? 0.0) +
         (currentPosition.dy - previousPosition.dy) / widget.friction;
     _previousPosition = currentPosition;
+
+    // Auto-reset removed to maintain lock during reverse drag.
+    // The window will visually rubber-band, but the inner scroll will remain locked.
+
     setState(() {
       _dragOffset = Offset(newX, newY);
     });
@@ -296,6 +356,10 @@ class _OverscrollPopState extends State<OverscrollPop>
       case DragToPopDirection.toLeft:
       case DragToPopDirection.toRight:
         return (DragStartDetails dragDetails) {
+          if (!_hasTriggeredStart) {
+            widget.onDragStart?.call();
+            _hasTriggeredStart = true;
+          }
           _isDraggingToPopStart = true;
           _isDraggingToPop = true;
           _previousPosition = dragDetails.globalPosition;
@@ -335,6 +399,10 @@ class _OverscrollPopState extends State<OverscrollPop>
       case DragToPopDirection.toTop:
       case DragToPopDirection.toBottom:
         return (DragStartDetails dragDetails) {
+          if (!_hasTriggeredStart) {
+            widget.onDragStart?.call();
+            _hasTriggeredStart = true;
+          }
           _isDraggingToPopStart = true;
           _isDraggingToPop = true;
           _previousPosition = dragDetails.globalPosition;
@@ -381,6 +449,9 @@ Future<dynamic> pushOverscrollRoute({
   String? barrierLabel,
   bool barrierDismissible = false,
   bool maintainState = true,
+  VoidCallback? onDragStart,
+  VoidCallback? onDragStop,
+  VoidCallback? onDismiss,
 }) async =>
     await Navigator.of(context).push(
       PageRouteBuilder(
@@ -411,6 +482,9 @@ Future<dynamic> pushOverscrollRoute({
           dragToPopDirection: dragToPopDirection,
           scrollToPopOption: scrollToPopOption,
           borderRadius: borderRadius,
+          onDragStart: onDragStart,
+          onDragStop: onDragStop,
+          onDismiss: onDismiss,
           child: child,
         ),
         maintainState: maintainState,
